@@ -269,15 +269,21 @@ async function fetchTokenStats(address, chain) {
   const pairs = (data.pairs || []).filter(p => p.chainId === chain);
   if (pairs.length === 0) throw new Error(`${chain} 上找不到此代币`);
 
-  const volH1 = pairs.reduce((s, p) => s + (p.volume?.h1 || 0), 0);
-  const volH24 = pairs.reduce((s, p) => s + (p.volume?.h24 || 0), 0);
-  const buysH1 = pairs.reduce((s, p) => s + (p.txns?.h1?.buys || 0), 0);
-  const sellsH1 = pairs.reduce((s, p) => s + (p.txns?.h1?.sells || 0), 0);
-  const buysH24 = pairs.reduce((s, p) => s + (p.txns?.h24?.buys || 0), 0);
-  const sellsH24 = pairs.reduce((s, p) => s + (p.txns?.h24?.sells || 0), 0);
+  // 只统计 baseToken 是目标代币的 pair, 避免把该代币作为 quoteToken 的交易也算进来
+  const addrLc = address.toLowerCase();
+  const basePairs = pairs.filter(p => p.baseToken?.address?.toLowerCase() === addrLc);
+  const aggPairs = basePairs.length > 0 ? basePairs : pairs;
 
-  pairs.sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0));
-  const top = pairs[0];
+  const volH1 = aggPairs.reduce((s, p) => s + (p.volume?.h1 || 0), 0);
+  const volH24 = aggPairs.reduce((s, p) => s + (p.volume?.h24 || 0), 0);
+  const buysH1 = aggPairs.reduce((s, p) => s + (p.txns?.h1?.buys || 0), 0);
+  const sellsH1 = aggPairs.reduce((s, p) => s + (p.txns?.h1?.sells || 0), 0);
+  const buysH24 = aggPairs.reduce((s, p) => s + (p.txns?.h24?.buys || 0), 0);
+  const sellsH24 = aggPairs.reduce((s, p) => s + (p.txns?.h24?.sells || 0), 0);
+  const liquidityUsd = aggPairs.reduce((s, p) => s + (p.liquidity?.usd || 0), 0);
+
+  aggPairs.sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0));
+  const top = aggPairs[0];
 
   return {
     symbol: top.baseToken.symbol,
@@ -285,12 +291,12 @@ async function fetchTokenStats(address, chain) {
     priceUsd: Number(top.priceUsd || 0),
     priceChange1h: top.priceChange?.h1 ?? 0,
     priceChange24h: top.priceChange?.h24 ?? 0,
-    liquidityUsd: top.liquidity?.usd || 0,
+    liquidityUsd,
     volH1, volH24, buysH1, sellsH1, buysH24, sellsH24,
     fdv: Number(top.fdv || 0),
     marketCap: Number(top.marketCap || 0),
     pairCreatedAt: Number(top.pairCreatedAt || 0),
-    pairCount: pairs.length,
+    pairCount: aggPairs.length,
     topDex: top.dexId,
     url: top.url
   };
