@@ -1,12 +1,14 @@
 import 'dotenv/config';
 import cron from 'node-cron';
-import fs from 'node:fs/promises';
+import fs from 'node:fs';
 import path from 'node:path';
+import Database from 'better-sqlite3';
 
 const {
   BOT_TOKEN,
   CHAT_ID,
   DATA_DIR = './data',
+  SQLITE_PATH,
   DEFAULT_CHAIN = 'bsc',
   DEFAULT_THRESHOLD_USD = '100000',
   DEFAULT_THRESHOLD_24H_USD = '1000000',
@@ -20,73 +22,145 @@ if (!BOT_TOKEN || !CHAT_ID) {
 }
 
 const CHAT_ID_STR = String(CHAT_ID);
-const STATE_FILE = path.join(DATA_DIR, 'tokens.json');
-const HISTORY_FILE = path.join(DATA_DIR, 'history.json');
+const DB_PATH = SQLITE_PATH || path.join(DATA_DIR, 'bot.db');
 const COOLDOWN_1H_MS = 30 * 60 * 1000;
 const COOLDOWN_24H_MS = 6 * 60 * 60 * 1000;
 const HISTORY_RETENTION_MS = Math.max(1, Number(HISTORY_DAYS)) * 24 * 60 * 60 * 1000;
 
-let state = { tokens: [], lastAlertTs: {} };
-let history = {};
+// ========== SQLite ==========
+fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
+const db = new Database(DB_PATH);
+db.pragma('journal_mode = WAL');
+db.pragma('synchronous = NORMAL');
+db.pragma('foreign_keys = ON');
 
-// ========== 原子持久化 ==========
-// 崩溃安全: 写 .tmp -> rename; 覆盖前备份 .bak
-async function readJson(file, fallback) {
-  for (const candidate of [file, `${file}.bak`]) {
+db.exec(`
+  CREATE TABLE IF NOT EXISTS tokens (
+    chain        TEXT NOT NULL,
+    address      TEXT NOT NULL,
+    threshold    REAL NOT NULL,
+    threshold24h REAL NOT NULL DEFAULT 0,
+    added_at     TEXT NOT NULL,
+    PRIMARY KEY (chain, address)
+  );
+  CREATE TABLE IF NOT EXISTS alert_cooldowns (
+    key     TEXT PRIMARY KEY,
+    last_ts INTEGER NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS history (
+    chain         TEXT NOT NULL,
+    address       TEXT NOT NULL,
+    t             INTEGER NOT NULL,
+    price_usd     REAL,
+    vol_h1        REAL,
+    vol_h24       REAL,
+    liquidity_usd REAL,
+    buys_h1       INTEGER,
+    sells_h1      INTEGER,
+    PRIMARY KEY (chain, address, t)
+  );
+  CREATE INDEX IF NOT EXISTS idx_history_key_t ON history (chain, address, t DESC);
+`);
+
+const q = {
+  listTokens: db.prepare(
+    'SELECT chain, address, threshold, threshold24h, added_at AS addedAt FROM tokens ORDER BY added_at ASC'
+  ),
+  findToken: db.prepare(
+    'SELECT chain, address, threshold, threshold24h, added_at AS addedAt FROM tokens WHERE lower(address) = lower(?) LIMIT 1'
+  ),
+  insertToken: db.prepare(
+    'INSERT INTO tokens (chain, address, threshold, threshold24h, added_at) VALUES (?, ?, ?, ?, ?)'
+  ),
+  deleteToken: db.prepare('DELETE FROM tokens WHERE chain = ? AND address = ?'),
+  setThreshold: db.prepare('UPDATE tokens SET threshold = ? WHERE chain = ? AND address = ?'),
+  setThreshold24h: db.prepare('UPDATE tokens SET threshold24h = ? WHERE chain = ? AND address = ?'),
+
+  getCooldown: db.prepare('SELECT last_ts FROM alert_cooldowns WHERE key = ?'),
+  setCooldown: db.prepare(
+    'INSERT INTO alert_cooldowns (key, last_ts) VALUES (?, ?) ' +
+    'ON CONFLICT(key) DO UPDATE SET last_ts = excluded.last_ts'
+  ),
+  deleteCooldownsLike: db.prepare('DELETE FROM alert_cooldowns WHERE key LIKE ?'),
+
+  insertHistory: db.prepare(
+    'INSERT OR REPLACE INTO history ' +
+    '(chain, address, t, price_usd, vol_h1, vol_h24, liquidity_usd, buys_h1, sells_h1) ' +
+    'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+  ),
+  historyRange: db.prepare(
+    'SELECT t, price_usd AS priceUsd, vol_h1 AS volH1, vol_h24 AS volH24, ' +
+    '       liquidity_usd AS liquidityUsd, buys_h1 AS buysH1, sells_h1 AS sellsH1 ' +
+    'FROM history WHERE chain = ? AND address = ? AND t >= ? ORDER BY t ASC'
+  ),
+  countHistory: db.prepare('SELECT COUNT(*) AS n FROM history WHERE chain = ? AND address = ?'),
+  deleteHistoryFor: db.prepare('DELETE FROM history WHERE chain = ? AND address = ?'),
+  pruneHistory: db.prepare('DELETE FROM history WHERE t < ?')
+};
+
+// ========== 旧 JSON 自动迁移 ==========
+function migrateFromJson() {
+  const existing = db.prepare('SELECT COUNT(*) AS n FROM tokens').get().n;
+  if (existing > 0) return;
+
+  const tokensJson = path.join(DATA_DIR, 'tokens.json');
+  const historyJson = path.join(DATA_DIR, 'history.json');
+  let migrated = false;
+
+  if (fs.existsSync(tokensJson)) {
     try {
-      const text = await fs.readFile(candidate, 'utf8');
-      const parsed = JSON.parse(text);
-      if (candidate !== file) console.warn(`主文件损坏, 已从 ${candidate} 恢复`);
-      return parsed;
+      const raw = JSON.parse(fs.readFileSync(tokensJson, 'utf8'));
+      const run = db.transaction(() => {
+        for (const t of (raw.tokens || [])) {
+          if (!t.address || !t.chain) continue;
+          q.insertToken.run(
+            String(t.chain).toLowerCase(),
+            t.address,
+            Number(t.threshold) || Number(DEFAULT_THRESHOLD_USD),
+            Number(t.threshold24h) || 0,
+            t.addedAt || new Date().toISOString()
+          );
+        }
+        for (const [key, ts] of Object.entries(raw.lastAlertTs || {})) {
+          q.setCooldown.run(key, Number(ts) || 0);
+        }
+      });
+      run();
+      fs.renameSync(tokensJson, `${tokensJson}.migrated`);
+      migrated = true;
+      console.log('✅ 已从 tokens.json 迁移到 SQLite');
     } catch (err) {
-      if (err.code === 'ENOENT') continue;
-      console.error(`读取 ${candidate} 失败:`, err.message);
+      console.error('迁移 tokens.json 失败:', err.message);
     }
   }
-  return fallback;
-}
 
-async function writeJson(file, data) {
-  await fs.mkdir(path.dirname(file), { recursive: true });
-  const tmp = `${file}.tmp`;
-  const bak = `${file}.bak`;
-  await fs.writeFile(tmp, JSON.stringify(data, null, 2));
-  try { await fs.copyFile(file, bak); } catch (err) {
-    if (err.code !== 'ENOENT') console.warn('备份失败:', err.message);
+  if (fs.existsSync(historyJson)) {
+    try {
+      const raw = JSON.parse(fs.readFileSync(historyJson, 'utf8'));
+      const run = db.transaction(() => {
+        for (const [key, list] of Object.entries(raw || {})) {
+          const [chain, address] = key.split(':');
+          if (!chain || !address) continue;
+          for (const x of (list || [])) {
+            if (!x || typeof x.t !== 'number') continue;
+            q.insertHistory.run(
+              chain, address, x.t,
+              x.priceUsd ?? null, x.volH1 ?? null, x.volH24 ?? null,
+              x.liquidityUsd ?? null, x.buysH1 ?? null, x.sellsH1 ?? null
+            );
+          }
+        }
+      });
+      run();
+      fs.renameSync(historyJson, `${historyJson}.migrated`);
+      migrated = true;
+      console.log('✅ 已从 history.json 迁移到 SQLite');
+    } catch (err) {
+      console.error('迁移 history.json 失败:', err.message);
+    }
   }
-  await fs.rename(tmp, file);
-}
 
-async function loadState() {
-  state = { tokens: [], lastAlertTs: {}, ...(await readJson(STATE_FILE, {})) };
-}
-
-async function saveState() {
-  try {
-    await writeJson(STATE_FILE, state);
-  } catch (err) {
-    console.error('保存状态失败:', err.message);
-  }
-}
-
-async function loadHistory() {
-  history = await readJson(HISTORY_FILE, {});
-}
-
-async function saveHistory() {
-  try {
-    await writeJson(HISTORY_FILE, history);
-  } catch (err) {
-    console.error('保存历史失败:', err.message);
-  }
-}
-
-function pushHistory(token, snapshot) {
-  const key = `${token.chain}:${token.address}`;
-  const list = history[key] || (history[key] = []);
-  list.push(snapshot);
-  const cutoff = Date.now() - HISTORY_RETENTION_MS;
-  while (list.length && list[0].t < cutoff) list.shift();
+  if (migrated) console.log('旧 JSON 已改名为 .migrated 备份保留');
 }
 
 // ========== Telegram ==========
@@ -183,17 +257,12 @@ async function checkToken(token, { force = false, isHourly = false, isDaily = fa
     const breach1h = s.volH1 >= token.threshold;
     const breach24h = token.threshold24h > 0 && s.volH24 >= token.threshold24h;
 
-    // 小时级定时任务顺带记录历史快照
     if (isHourly) {
-      pushHistory(token, {
-        t: Date.now(),
-        priceUsd: s.priceUsd,
-        volH1: s.volH1,
-        volH24: s.volH24,
-        liquidityUsd: s.liquidityUsd,
-        buysH1: s.buysH1,
-        sellsH1: s.sellsH1
-      });
+      q.insertHistory.run(
+        token.chain, token.address, Date.now(),
+        s.priceUsd, s.volH1, s.volH24,
+        s.liquidityUsd, s.buysH1, s.sellsH1
+      );
     }
 
     if (isDaily) {
@@ -201,8 +270,8 @@ async function checkToken(token, { force = false, isHourly = false, isDaily = fa
       return;
     }
     if (isHourly) {
-      if (breach1h) state.lastAlertTs[`${key}:1h`] = Date.now();
-      if (breach24h) state.lastAlertTs[`${key}:24h`] = Date.now();
+      if (breach1h) q.setCooldown.run(`${key}:1h`, Date.now());
+      if (breach24h) q.setCooldown.run(`${key}:24h`, Date.now());
       await sendMsg(buildMsg(s, token, {
         alertKind: breach1h ? '1h' : breach24h ? '24h' : null,
         isHourly: true
@@ -218,19 +287,17 @@ async function checkToken(token, { force = false, isHourly = false, isDaily = fa
 
     const now = Date.now();
     if (breach1h) {
-      const last = state.lastAlertTs[`${key}:1h`] || 0;
+      const last = q.getCooldown.get(`${key}:1h`)?.last_ts || 0;
       if (now - last >= COOLDOWN_1H_MS) {
-        state.lastAlertTs[`${key}:1h`] = now;
+        q.setCooldown.run(`${key}:1h`, now);
         await sendMsg(buildMsg(s, token, { alertKind: '1h' }));
-        await saveState();
       }
     }
     if (breach24h) {
-      const last = state.lastAlertTs[`${key}:24h`] || 0;
+      const last = q.getCooldown.get(`${key}:24h`)?.last_ts || 0;
       if (now - last >= COOLDOWN_24H_MS) {
-        state.lastAlertTs[`${key}:24h`] = now;
+        q.setCooldown.run(`${key}:24h`, now);
         await sendMsg(buildMsg(s, token, { alertKind: '24h' }));
-        await saveState();
       }
     }
   } catch (err) {
@@ -240,26 +307,30 @@ async function checkToken(token, { force = false, isHourly = false, isDaily = fa
 }
 
 async function hourlyReport() {
-  if (state.tokens.length === 0) return;
-  for (const token of state.tokens) {
+  const tokens = q.listTokens.all();
+  if (tokens.length === 0) return;
+  for (const token of tokens) {
     await checkToken(token, { isHourly: true });
     await new Promise(r => setTimeout(r, 500));
   }
-  await saveState();
-  await saveHistory();
 }
 
 async function dailyReport() {
-  if (state.tokens.length === 0) return;
-  for (const token of state.tokens) {
+  const tokens = q.listTokens.all();
+  if (tokens.length === 0) return;
+  for (const token of tokens) {
     await checkToken(token, { isDaily: true });
     await new Promise(r => setTimeout(r, 500));
   }
+  // 日报时顺便清理过期历史
+  const removed = q.pruneHistory.run(Date.now() - HISTORY_RETENTION_MS).changes;
+  if (removed > 0) console.log(`清理过期历史 ${removed} 条`);
 }
 
 async function thresholdCheck() {
   if (new Date().getMinutes() === 0) return;
-  for (const token of state.tokens) {
+  const tokens = q.listTokens.all();
+  for (const token of tokens) {
     await checkToken(token, {});
     await new Promise(r => setTimeout(r, 500));
   }
@@ -281,17 +352,11 @@ const HELP = `*🤖 代币交易量监控*
 默认链: \`${DEFAULT_CHAIN}\`
 默认 1h 阈值: \`$${fmt(Number(DEFAULT_THRESHOLD_USD), 0)}\`
 默认 24h 阈值: \`$${fmt(Number(DEFAULT_THRESHOLD_24H_USD), 0)}\`
-历史保留: ${HISTORY_DAYS} 天
-
-示例:
-\`/add 0x0e09fabb73bd3ade0a17ecc321fd13a19e81ce82\`
-\`/add 0xabc... 50000 500000 ethereum\`
-\`/history 0xabc... 72\``;
+历史保留: ${HISTORY_DAYS} 天`;
 
 function findToken(addr) {
   if (!addr) return null;
-  const a = addr.toLowerCase();
-  return state.tokens.find(t => t.address.toLowerCase() === a);
+  return q.findToken.get(addr) || null;
 }
 
 function sparkline(values) {
@@ -304,15 +369,13 @@ function sparkline(values) {
 }
 
 function historySummary(token, hours) {
-  const key = `${token.chain}:${token.address}`;
-  const list = history[key] || [];
   const cutoff = Date.now() - hours * 60 * 60 * 1000;
-  const recent = list.filter(x => x.t >= cutoff);
+  const recent = q.historyRange.all(token.chain, token.address, cutoff);
   if (recent.length === 0) return null;
 
-  const vols = recent.map(x => x.volH1);
-  const prices = recent.map(x => x.priceUsd);
-  const liqs = recent.map(x => x.liquidityUsd);
+  const vols = recent.map(x => x.volH1 || 0);
+  const prices = recent.map(x => x.priceUsd || 0);
+  const liqs = recent.map(x => x.liquidityUsd || 0);
   const totalBuys = recent.reduce((s, x) => s + (x.buysH1 || 0), 0);
   const totalSells = recent.reduce((s, x) => s + (x.sellsH1 || 0), 0);
   const volTotal = vols.reduce((s, v) => s + v, 0);
@@ -341,13 +404,14 @@ async function handleCmd(text, chatId) {
   }
 
   if (command === '/list') {
-    if (state.tokens.length === 0) {
+    const tokens = q.listTokens.all();
+    if (tokens.length === 0) {
       return sendMsg('📭 还没有监控任何代币\n用 `/add <地址>` 添加', chatId);
     }
-    const lines = [`*📋 监控中 ${state.tokens.length} 个代币*`, ''];
-    for (const t of state.tokens) {
+    const lines = [`*📋 监控中 ${tokens.length} 个代币*`, ''];
+    for (const t of tokens) {
       const t24 = t.threshold24h > 0 ? `$${fmt(t.threshold24h, 0)}` : '关闭';
-      const hist = history[`${t.chain}:${t.address}`]?.length || 0;
+      const hist = q.countHistory.get(t.chain, t.address).n;
       lines.push(`• \`${t.address}\``);
       lines.push(`  ${t.chain} · 1h $${fmt(t.threshold, 0)} · 24h ${t24} · 历史 ${hist} 条`);
     }
@@ -365,14 +429,7 @@ async function handleCmd(text, chatId) {
     const chain = (chainArg || DEFAULT_CHAIN).toLowerCase();
     try {
       const s = await fetchTokenStats(address, chain);
-      state.tokens.push({
-        address,
-        chain,
-        threshold,
-        threshold24h,
-        addedAt: new Date().toISOString()
-      });
-      await saveState();
+      q.insertToken.run(chain, address, threshold, threshold24h, new Date().toISOString());
       const t24Line = threshold24h > 0
         ? `24h 阈值: $${fmt(threshold24h, 0)}`
         : '24h 阈值: 关闭';
@@ -393,15 +450,15 @@ async function handleCmd(text, chatId) {
   if (command === '/remove') {
     const [address] = args;
     if (!address) return sendMsg('用法: `/remove <地址>`', chatId);
-    const idx = state.tokens.findIndex(t => t.address.toLowerCase() === address.toLowerCase());
-    if (idx === -1) return sendMsg('❌ 列表中没有这个代币', chatId);
-    const removed = state.tokens.splice(idx, 1)[0];
-    delete state.lastAlertTs[`${removed.chain}:${removed.address}:1h`];
-    delete state.lastAlertTs[`${removed.chain}:${removed.address}:24h`];
-    delete history[`${removed.chain}:${removed.address}`];
-    await saveState();
-    await saveHistory();
-    return sendMsg(`🗑 已删除 \`${removed.address}\` (含历史)`, chatId);
+    const token = findToken(address);
+    if (!token) return sendMsg('❌ 列表中没有这个代币', chatId);
+    const txn = db.transaction(() => {
+      q.deleteToken.run(token.chain, token.address);
+      q.deleteCooldownsLike.run(`${token.chain}:${token.address}:%`);
+      q.deleteHistoryFor.run(token.chain, token.address);
+    });
+    txn();
+    return sendMsg(`🗑 已删除 \`${token.address}\` (含历史)`, chatId);
   }
 
   if (command === '/threshold') {
@@ -410,10 +467,8 @@ async function handleCmd(text, chatId) {
     if (!token) return sendMsg('❌ 列表中没有这个代币', chatId);
     const threshold = Number(thresholdStr);
     if (!threshold || threshold <= 0) return sendMsg('用法: `/threshold <地址> <阈值USD>`', chatId);
-    const old = token.threshold;
-    token.threshold = threshold;
-    await saveState();
-    return sendMsg(`✅ 1h 阈值 $${fmt(old, 0)} → $${fmt(threshold, 0)}`, chatId);
+    q.setThreshold.run(threshold, token.chain, token.address);
+    return sendMsg(`✅ 1h 阈值 $${fmt(token.threshold, 0)} → $${fmt(threshold, 0)}`, chatId);
   }
 
   if (command === '/threshold24h') {
@@ -427,10 +482,8 @@ async function handleCmd(text, chatId) {
     if (Number.isNaN(threshold) || threshold < 0) {
       return sendMsg('❌ 阈值必须是 >=0 的数字 (0=关闭)', chatId);
     }
-    const old = token.threshold24h || 0;
-    token.threshold24h = threshold;
-    await saveState();
-    const oldStr = old > 0 ? `$${fmt(old, 0)}` : '关闭';
+    q.setThreshold24h.run(threshold, token.chain, token.address);
+    const oldStr = token.threshold24h > 0 ? `$${fmt(token.threshold24h, 0)}` : '关闭';
     const newStr = threshold > 0 ? `$${fmt(threshold, 0)}` : '关闭';
     return sendMsg(`✅ 24h 阈值 ${oldStr} → ${newStr}`, chatId);
   }
@@ -452,7 +505,8 @@ async function handleCmd(text, chatId) {
     if (!address) return sendMsg('用法: `/history <地址> [小时数]`', chatId);
     const token = findToken(address);
     if (!token) return sendMsg('❌ 列表中没有这个代币, 请先 /add', chatId);
-    const hours = Math.max(1, Math.min(Number(hoursStr) || 24, HISTORY_DAYS * 24));
+    const maxHours = Math.max(1, Number(HISTORY_DAYS)) * 24;
+    const hours = Math.max(1, Math.min(Number(hoursStr) || 24, maxHours));
     const h = historySummary(token, hours);
     if (!h) return sendMsg(`📭 最近 ${hours}h 还没有历史数据\n(每小时自动记录, 新添加的代币需等待)`, chatId);
     const priceIcon = h.priceChange >= 0 ? '📈' : '📉';
@@ -508,31 +562,24 @@ async function pollUpdates() {
 
 // ========== 启动 ==========
 (async () => {
-  await loadState();
-  await loadHistory();
-  // 历史数据兼容: 为旧代币补 threshold24h 字段
-  for (const t of state.tokens) {
-    if (t.threshold24h === undefined) {
-      t.threshold24h = Number(DEFAULT_THRESHOLD_24H_USD);
-    }
-  }
+  migrateFromJson();
 
-  // 启动时清理一次过期历史
-  const cutoff = Date.now() - HISTORY_RETENTION_MS;
-  for (const key of Object.keys(history)) {
-    history[key] = history[key].filter(x => x.t >= cutoff);
-    if (history[key].length === 0) delete history[key];
-  }
+  // 启动时清理过期历史
+  const removed = q.pruneHistory.run(Date.now() - HISTORY_RETENTION_MS).changes;
+  if (removed > 0) console.log(`启动清理过期历史 ${removed} 条`);
+
+  const tokenCount = q.listTokens.all().length;
+  const historyCount = db.prepare('SELECT COUNT(*) AS n FROM history').get().n;
 
   console.log('🤖 监控启动');
-  console.log(`   监控中: ${state.tokens.length} 个代币`);
-  console.log(`   历史条目: ${Object.values(history).reduce((s, l) => s + l.length, 0)}`);
+  console.log(`   SQLite: ${DB_PATH}`);
+  console.log(`   监控中: ${tokenCount} 个代币`);
+  console.log(`   历史条目: ${historyCount}`);
   console.log(`   时区: ${TIMEZONE}`);
-  console.log(`   数据目录: ${DATA_DIR}`);
 
   await sendMsg(
     `🤖 *监控已启动*\n` +
-    `当前监控 ${state.tokens.length} 个代币\n` +
+    `当前监控 ${tokenCount} 个代币\n` +
     `历史保留 ${HISTORY_DAYS} 天\n` +
     `发 /help 查看命令`
   );
@@ -541,10 +588,10 @@ async function pollUpdates() {
   cron.schedule('0 0 * * *', dailyReport, { timezone: TIMEZONE });
   cron.schedule('*/5 * * * *', thresholdCheck, { timezone: TIMEZONE });
 
-  // 进程退出时最后保存一次, 避免丢失最近的内存变更
-  const shutdown = async (sig) => {
-    console.log(`收到 ${sig}, 正在保存并退出...`);
-    try { await saveState(); await saveHistory(); } catch {}
+  // 优雅退出: 关闭 WAL 检查点
+  const shutdown = (sig) => {
+    console.log(`收到 ${sig}, 关闭数据库...`);
+    try { db.close(); } catch (err) { console.error('关闭失败:', err.message); }
     process.exit(0);
   };
   process.on('SIGINT', () => shutdown('SIGINT'));

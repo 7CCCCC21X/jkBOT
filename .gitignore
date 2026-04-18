@@ -3,4 +3,7 @@ node_modules/
 *.log
 .DS_Store
 data/
+*.db
+*.db-wal
+*.db-shm
 
