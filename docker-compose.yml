@@ -1,0 +1,17 @@
+services:
+  bot:
+    build: .
+    image: jkbot:latest
+    container_name: jkbot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATA_DIR: /data
+      SQLITE_PATH: /data/bot.db
+    volumes:
+      # 命名卷, 重新部署 / 重建容器不会丢失 bot.db
+      - jkbot_data:/data
+
+volumes:
+  jkbot_data:
