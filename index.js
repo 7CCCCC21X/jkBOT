@@ -12,6 +12,9 @@ const {
   DEFAULT_CHAIN = 'bsc',
   DEFAULT_THRESHOLD_USD = '100000',
   DEFAULT_THRESHOLD_24H_USD = '1000000',
+  DEFAULT_PRICE_ALERT_PCT = '10',
+  DEFAULT_LIQ_DROP_PCT = '30',
+  DEFAULT_IMBALANCE_RATIO = '5',
   HISTORY_DAYS = '30',
   TIMEZONE = 'Asia/Shanghai'
 } = process.env;
@@ -25,6 +28,11 @@ const CHAT_ID_STR = String(CHAT_ID);
 const DB_PATH = SQLITE_PATH || path.join(DATA_DIR, 'bot.db');
 const COOLDOWN_1H_MS = 30 * 60 * 1000;
 const COOLDOWN_24H_MS = 6 * 60 * 60 * 1000;
+const COOLDOWN_PRICE_MS = 30 * 60 * 1000;
+const COOLDOWN_LIQ_MS = 30 * 60 * 1000;
+const COOLDOWN_IMB_MS = 60 * 60 * 1000;
+const LIQ_SNAPSHOT_STALE_MS = 2 * 60 * 60 * 1000;
+const IMB_MIN_TXNS = 10;
 const HISTORY_RETENTION_MS = Math.max(1, Number(HISTORY_DAYS)) * 24 * 60 * 60 * 1000;
 
 // ========== SQLite ==========
@@ -62,19 +70,39 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_history_key_t ON history (chain, address, t DESC);
 `);
 
+// 增量迁移: 给老数据补新列 (ALTER TABLE ADD COLUMN 会用 DEFAULT 回填)
+const tokenCols = db.prepare('PRAGMA table_info(tokens)').all().map(r => r.name);
+if (!tokenCols.includes('price_alert_pct')) {
+  db.exec(`ALTER TABLE tokens ADD COLUMN price_alert_pct REAL NOT NULL DEFAULT ${Number(DEFAULT_PRICE_ALERT_PCT)}`);
+}
+if (!tokenCols.includes('liq_drop_pct')) {
+  db.exec(`ALTER TABLE tokens ADD COLUMN liq_drop_pct REAL NOT NULL DEFAULT ${Number(DEFAULT_LIQ_DROP_PCT)}`);
+}
+if (!tokenCols.includes('imbalance_ratio')) {
+  db.exec(`ALTER TABLE tokens ADD COLUMN imbalance_ratio REAL NOT NULL DEFAULT ${Number(DEFAULT_IMBALANCE_RATIO)}`);
+}
+
+const TOKEN_COLS =
+  'chain, address, threshold, threshold24h, added_at AS addedAt, ' +
+  'price_alert_pct AS priceAlertPct, liq_drop_pct AS liqDropPct, imbalance_ratio AS imbalanceRatio';
+
 const q = {
   listTokens: db.prepare(
-    'SELECT chain, address, threshold, threshold24h, added_at AS addedAt FROM tokens ORDER BY added_at ASC'
+    `SELECT ${TOKEN_COLS} FROM tokens ORDER BY added_at ASC`
   ),
   findToken: db.prepare(
-    'SELECT chain, address, threshold, threshold24h, added_at AS addedAt FROM tokens WHERE lower(address) = lower(?) LIMIT 1'
+    `SELECT ${TOKEN_COLS} FROM tokens WHERE lower(address) = lower(?) LIMIT 1`
   ),
   insertToken: db.prepare(
-    'INSERT INTO tokens (chain, address, threshold, threshold24h, added_at) VALUES (?, ?, ?, ?, ?)'
+    'INSERT INTO tokens (chain, address, threshold, threshold24h, added_at, ' +
+    'price_alert_pct, liq_drop_pct, imbalance_ratio) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
   ),
   deleteToken: db.prepare('DELETE FROM tokens WHERE chain = ? AND address = ?'),
   setThreshold: db.prepare('UPDATE tokens SET threshold = ? WHERE chain = ? AND address = ?'),
   setThreshold24h: db.prepare('UPDATE tokens SET threshold24h = ? WHERE chain = ? AND address = ?'),
+  setPriceAlert: db.prepare('UPDATE tokens SET price_alert_pct = ? WHERE chain = ? AND address = ?'),
+  setLiqDrop: db.prepare('UPDATE tokens SET liq_drop_pct = ? WHERE chain = ? AND address = ?'),
+  setImbalance: db.prepare('UPDATE tokens SET imbalance_ratio = ? WHERE chain = ? AND address = ?'),
 
   getCooldown: db.prepare('SELECT last_ts FROM alert_cooldowns WHERE key = ?'),
   setCooldown: db.prepare(
@@ -92,6 +120,10 @@ const q = {
     'SELECT t, price_usd AS priceUsd, vol_h1 AS volH1, vol_h24 AS volH24, ' +
     '       liquidity_usd AS liquidityUsd, buys_h1 AS buysH1, sells_h1 AS sellsH1 ' +
     'FROM history WHERE chain = ? AND address = ? AND t >= ? ORDER BY t ASC'
+  ),
+  lastSnapshot: db.prepare(
+    'SELECT t, liquidity_usd AS liquidityUsd FROM history ' +
+    'WHERE chain = ? AND address = ? ORDER BY t DESC LIMIT 1'
   ),
   countHistory: db.prepare('SELECT COUNT(*) AS n FROM history WHERE chain = ? AND address = ?'),
   deleteHistoryFor: db.prepare('DELETE FROM history WHERE chain = ? AND address = ?'),
@@ -118,7 +150,10 @@ function migrateFromJson() {
             t.address,
             Number(t.threshold) || Number(DEFAULT_THRESHOLD_USD),
             Number(t.threshold24h) || 0,
-            t.addedAt || new Date().toISOString()
+            t.addedAt || new Date().toISOString(),
+            Number(DEFAULT_PRICE_ALERT_PCT),
+            Number(DEFAULT_LIQ_DROP_PCT),
+            Number(DEFAULT_IMBALANCE_RATIO)
           );
         }
         for (const [key, ts] of Object.entries(raw.lastAlertTs || {})) {
@@ -252,10 +287,76 @@ async function fetchTokenStats(address, chain) {
     priceChange24h: top.priceChange?.h24 ?? 0,
     liquidityUsd: top.liquidity?.usd || 0,
     volH1, volH24, buysH1, sellsH1, buysH24, sellsH24,
+    fdv: Number(top.fdv || 0),
+    marketCap: Number(top.marketCap || 0),
+    pairCreatedAt: Number(top.pairCreatedAt || 0),
     pairCount: pairs.length,
     topDex: top.dexId,
     url: top.url
   };
+}
+
+function ageStr(ms) {
+  if (!ms) return '';
+  const diffDays = (Date.now() - ms) / (24 * 60 * 60 * 1000);
+  if (diffDays < 1) {
+    const hrs = Math.floor(diffDays * 24);
+    return hrs <= 0 ? '< 1 小时' : `${hrs} 小时`;
+  }
+  if (diffDays < 30) return `${Math.floor(diffDays)} 天`;
+  if (diffDays < 365) return `${Math.floor(diffDays / 30)} 月`;
+  return `${(diffDays / 365).toFixed(1)} 年`;
+}
+
+// 返回当前触发的告警列表 (按优先级排序: liq > price > 24h > 1h > imb)
+function detectAlerts(s, token) {
+  const alerts = [];
+
+  // 流动性骤降: 对比最近一个历史快照
+  if (token.liqDropPct > 0) {
+    const snap = q.lastSnapshot.get(token.chain, token.address);
+    if (snap && snap.liquidityUsd > 0 && (Date.now() - snap.t) <= LIQ_SNAPSHOT_STALE_MS) {
+      const dropPct = ((snap.liquidityUsd - s.liquidityUsd) / snap.liquidityUsd) * 100;
+      if (dropPct >= token.liqDropPct) {
+        alerts.push({
+          kind: 'liq',
+          cooldown: COOLDOWN_LIQ_MS,
+          extra: { prevLiq: snap.liquidityUsd, dropPct }
+        });
+      }
+    }
+  }
+
+  // 价格异动
+  if (token.priceAlertPct > 0 && Math.abs(s.priceChange1h) >= token.priceAlertPct) {
+    alerts.push({ kind: 'price', cooldown: COOLDOWN_PRICE_MS });
+  }
+
+  // 24h 成交量
+  if (token.threshold24h > 0 && s.volH24 >= token.threshold24h) {
+    alerts.push({ kind: '24h', cooldown: COOLDOWN_24H_MS });
+  }
+
+  // 1h 成交量
+  if (s.volH1 >= token.threshold) {
+    alerts.push({ kind: '1h', cooldown: COOLDOWN_1H_MS });
+  }
+
+  // 买卖失衡 (至少 N 笔交易避免小样本噪声)
+  const totalTxns = s.buysH1 + s.sellsH1;
+  if (token.imbalanceRatio > 0 && totalTxns >= IMB_MIN_TXNS) {
+    const buys = s.buysH1, sells = s.sellsH1;
+    const ratio = sells > 0 ? buys / sells : Infinity;
+    if (ratio >= token.imbalanceRatio || (buys > 0 && (1 / ratio) >= token.imbalanceRatio)) {
+      alerts.push({
+        kind: 'imb',
+        cooldown: COOLDOWN_IMB_MS,
+        extra: { buys, sells, ratio, side: ratio >= 1 ? 'buy' : 'sell' }
+      });
+    }
+  }
+
+  return alerts;
 }
 
 function fmt(n, d = 2) {
@@ -264,29 +365,62 @@ function fmt(n, d = 2) {
   });
 }
 
-function buildMsg(s, token, { alertKind, isHourly, isDaily }) {
-  const header = alertKind === '1h' ? '🚨 *1h 交易量阈值告警*'
-    : alertKind === '24h' ? '🚨 *24h 交易量阈值告警*'
-    : isDaily ? '🌅 *每日交易量报告 (过去 24h)*'
-    : isHourly ? '⏰ *每小时交易量报告*'
-    : '📊 *交易量快照*';
+function alertHeader(kind) {
+  if (kind === '1h') return '🚨 *1h 交易量阈值告警*';
+  if (kind === '24h') return '🚨 *24h 交易量阈值告警*';
+  if (kind === 'price') return '📢 *价格异动告警*';
+  if (kind === 'liq') return '🔥🔥 *流动性骤降告警*';
+  if (kind === 'imb') return '⚖️ *买卖失衡告警*';
+  return null;
+}
+
+function alertLine(kind, s, token, extra) {
+  if (kind === '1h') return `⚠️ 1h 交易量超阈值 $${fmt(token.threshold, 0)}`;
+  if (kind === '24h') return `⚠️ 24h 交易量超阈值 $${fmt(token.threshold24h, 0)}`;
+  if (kind === 'price') {
+    const sign = s.priceChange1h >= 0 ? '+' : '';
+    return `⚠️ 1h 价格 ${sign}${fmt(s.priceChange1h)}% 超阈值 ±${fmt(token.priceAlertPct, 1)}%`;
+  }
+  if (kind === 'liq' && extra) {
+    return `⚠️ 流动性 $${fmt(extra.prevLiq, 0)} → $${fmt(s.liquidityUsd, 0)} (−${fmt(extra.dropPct, 1)}%)  警惕 rug`;
+  }
+  if (kind === 'imb' && extra) {
+    const sideTxt = extra.side === 'buy' ? '买方强势' : '卖方强势';
+    const ratioTxt = isFinite(extra.ratio) ? fmt(extra.ratio) : '∞';
+    return `⚠️ ${sideTxt}  买/卖 = ${ratioTxt}x  (买 ${extra.buys} / 卖 ${extra.sells})`;
+  }
+  return '';
+}
+
+function buildMsg(s, token, { alertKind, isHourly, isDaily, extra } = {}) {
+  const header = alertHeader(alertKind)
+    || (isDaily ? '🌅 *每日交易量报告 (过去 24h)*'
+      : isHourly ? '⏰ *每小时交易量报告*'
+      : '📊 *交易量快照*');
   const icon1h = s.priceChange1h >= 0 ? '📈' : '📉';
   const sign1h = s.priceChange1h >= 0 ? '+' : '';
   const icon24h = s.priceChange24h >= 0 ? '📈' : '📉';
   const sign24h = s.priceChange24h >= 0 ? '+' : '';
+  const avgH1 = (s.buysH1 + s.sellsH1) > 0 ? s.volH1 / (s.buysH1 + s.sellsH1) : 0;
+  const avgH24 = (s.buysH24 + s.sellsH24) > 0 ? s.volH24 / (s.buysH24 + s.sellsH24) : 0;
+  const bsRatioH1 = s.sellsH1 > 0 ? s.buysH1 / s.sellsH1 : (s.buysH1 > 0 ? Infinity : 1);
+  const bsRatioStr = isFinite(bsRatioH1) ? fmt(bsRatioH1) + 'x' : '∞';
+
   return [
     header, '',
     `*${s.name}* ($${s.symbol}) · ${token.chain}`,
     `💰 $${fmt(s.priceUsd, 6)}`,
     `   ${icon1h} 1h ${sign1h}${fmt(s.priceChange1h)}%   ${icon24h} 24h ${sign24h}${fmt(s.priceChange24h)}%`,
     '',
-    `🔥 1h 交易量: $${fmt(s.volH1, 0)}  (买 ${s.buysH1} / 卖 ${s.sellsH1})`,
-    `📦 24h 交易量: $${fmt(s.volH24, 0)}  (买 ${s.buysH24} / 卖 ${s.sellsH24})`,
+    `🔥 1h: $${fmt(s.volH1, 0)}  买 ${s.buysH1}/卖 ${s.sellsH1} (${bsRatioStr})  均笔 $${fmt(avgH1, 0)}`,
+    `📦 24h: $${fmt(s.volH24, 0)}  买 ${s.buysH24}/卖 ${s.sellsH24}  均笔 $${fmt(avgH24, 0)}`,
     `💧 流动性: $${fmt(s.liquidityUsd, 0)}`,
+    s.marketCap > 0 ? `🏷 市值: $${fmt(s.marketCap, 0)}` : '',
+    s.fdv > 0 && s.fdv !== s.marketCap ? `💎 FDV: $${fmt(s.fdv, 0)}` : '',
+    s.pairCreatedAt > 0 ? `⏳ 上线: ${ageStr(s.pairCreatedAt)}` : '',
     `🔗 ${s.pairCount} 对 (主: ${s.topDex})`,
     '',
-    alertKind === '1h' ? `⚠️ 1h 交易量超阈值 $${fmt(token.threshold, 0)}` : '',
-    alertKind === '24h' ? `⚠️ 24h 交易量超阈值 $${fmt(token.threshold24h, 0)}` : '',
+    alertLine(alertKind, s, token, extra),
     `[DexScreener](${s.url})`
   ].filter(Boolean).join('\n');
 }
@@ -296,8 +430,8 @@ async function checkToken(token, { force = false, isHourly = false, isDaily = fa
   const key = `${token.chain}:${token.address}`;
   try {
     const s = await fetchTokenStats(token.address, token.chain);
-    const breach1h = s.volH1 >= token.threshold;
-    const breach24h = token.threshold24h > 0 && s.volH24 >= token.threshold24h;
+    // detectAlerts 要先跑 (依赖 lastSnapshot), 然后再插入新快照
+    const alerts = detectAlerts(s, token);
 
     if (isHourly) {
       q.insertHistory.run(
@@ -312,34 +446,33 @@ async function checkToken(token, { force = false, isHourly = false, isDaily = fa
       return;
     }
     if (isHourly) {
-      if (breach1h) q.setCooldown.run(`${key}:1h`, Date.now());
-      if (breach24h) q.setCooldown.run(`${key}:24h`, Date.now());
+      // 小时报告只发 1 条, 带首个命中的告警类型, 同时刷新所有命中的冷却
+      const now = Date.now();
+      for (const a of alerts) q.setCooldown.run(`${key}:${a.kind}`, now);
+      const primary = alerts[0];
       await sendMsg(buildMsg(s, token, {
-        alertKind: breach1h ? '1h' : breach24h ? '24h' : null,
+        alertKind: primary?.kind,
+        extra: primary?.extra,
         isHourly: true
       }));
       return;
     }
     if (force) {
+      const primary = alerts[0];
       await sendMsg(buildMsg(s, token, {
-        alertKind: breach1h ? '1h' : breach24h ? '24h' : null
+        alertKind: primary?.kind,
+        extra: primary?.extra
       }));
       return;
     }
 
+    // 常规 5 分钟巡检: 每种告警独立冷却, 分别推送
     const now = Date.now();
-    if (breach1h) {
-      const last = q.getCooldown.get(`${key}:1h`)?.last_ts || 0;
-      if (now - last >= COOLDOWN_1H_MS) {
-        q.setCooldown.run(`${key}:1h`, now);
-        await sendMsg(buildMsg(s, token, { alertKind: '1h' }));
-      }
-    }
-    if (breach24h) {
-      const last = q.getCooldown.get(`${key}:24h`)?.last_ts || 0;
-      if (now - last >= COOLDOWN_24H_MS) {
-        q.setCooldown.run(`${key}:24h`, now);
-        await sendMsg(buildMsg(s, token, { alertKind: '24h' }));
+    for (const a of alerts) {
+      const last = q.getCooldown.get(`${key}:${a.kind}`)?.last_ts || 0;
+      if (now - last >= a.cooldown) {
+        q.setCooldown.run(`${key}:${a.kind}`, now);
+        await sendMsg(buildMsg(s, token, { alertKind: a.kind, extra: a.extra }));
       }
     }
   } catch (err) {
@@ -379,24 +512,29 @@ async function thresholdCheck() {
 }
 
 // ========== 命令处理 ==========
-const HELP = `*🤖 代币交易量监控*
+const HELP = `*🤖 代币链上监控*
 
 /menu - 打开主菜单
 /list - 查看监控列表 (带操作按钮)
 /add <地址> [阈值1h] [阈值24h] [链] - 添加代币
 /remove <地址> - 删除代币
-/threshold <地址> <阈值USD> - 修改 1h 阈值
-/threshold24h <地址> <阈值USD> - 修改 24h 阈值 (0=关闭)
 /check <地址> [链] - 立即查询一次
-/history <地址> [小时数] - 查看历史趋势 (默认 24h)
-/help - 显示帮助
+/history <地址> [小时数] - 查看历史趋势
 
-💡 /list 每条都带 📊查询 / 📈历史 / 🗑删除 按钮, 不用复制地址
+*告警阈值* (0 = 关闭)
+/threshold <地址> <USD> - 1h 成交量
+/threshold24h <地址> <USD> - 24h 成交量
+/pricealert <地址> <百分比> - 1h 价格异动 (±)
+/liqalert <地址> <百分比> - 流动性骤降 (防 rug)
+/imbalance <地址> <比例> - 买卖失衡 (常用 3-10)
 
-支持的链: bsc / ethereum / base / solana / polygon / arbitrum
+支持链: bsc / ethereum / base / solana / polygon / arbitrum
 默认链: \`${DEFAULT_CHAIN}\`
 默认 1h 阈值: \`$${fmt(Number(DEFAULT_THRESHOLD_USD), 0)}\`
 默认 24h 阈值: \`$${fmt(Number(DEFAULT_THRESHOLD_24H_USD), 0)}\`
+默认价格告警: \`±${fmt(Number(DEFAULT_PRICE_ALERT_PCT), 1)}%\`
+默认液降告警: \`${fmt(Number(DEFAULT_LIQ_DROP_PCT), 0)}%\`
+默认失衡阈值: \`${fmt(Number(DEFAULT_IMBALANCE_RATIO), 1)}x\`
 历史保留: ${HISTORY_DAYS} 天`;
 
 // 用于 Telegram "/" 自动补全菜单
@@ -407,8 +545,11 @@ const BOT_COMMANDS = [
   { command: 'remove', description: '删除代币' },
   { command: 'check', description: '立即查询代币' },
   { command: 'history', description: '查看历史趋势' },
-  { command: 'threshold', description: '修改 1h 交易量阈值' },
-  { command: 'threshold24h', description: '修改 24h 交易量阈值' },
+  { command: 'threshold', description: '1h 成交量阈值' },
+  { command: 'threshold24h', description: '24h 成交量阈值' },
+  { command: 'pricealert', description: '价格异动告警阈值' },
+  { command: 'liqalert', description: '流动性骤降告警' },
+  { command: 'imbalance', description: '买卖失衡告警' },
   { command: 'help', description: '使用帮助' }
 ];
 
@@ -419,10 +560,14 @@ function findToken(addr) {
 
 function tokenEntryText(t) {
   const t24 = t.threshold24h > 0 ? `$${fmt(t.threshold24h, 0)}` : '关闭';
+  const pa = t.priceAlertPct > 0 ? `±${fmt(t.priceAlertPct, 1)}%` : '关';
+  const ld = t.liqDropPct > 0 ? `${fmt(t.liqDropPct, 0)}%` : '关';
+  const ib = t.imbalanceRatio > 0 ? `${fmt(t.imbalanceRatio, 1)}x` : '关';
   const hist = q.countHistory.get(t.chain, t.address).n;
   return [
     `\`${t.address}\``,
-    `${t.chain} · 1h $${fmt(t.threshold, 0)} · 24h ${t24} · 历史 ${hist} 条`
+    `${t.chain} · 1h $${fmt(t.threshold, 0)} · 24h ${t24} · 历史 ${hist} 条`,
+    `⚙️ 价格 ${pa} · 液降 ${ld} · 失衡 ${ib}`
   ].join('\n');
 }
 
@@ -553,7 +698,12 @@ async function handleCmd(text, chatId) {
     const chain = (chainArg || DEFAULT_CHAIN).toLowerCase();
     try {
       const s = await fetchTokenStats(address, chain);
-      q.insertToken.run(chain, address, threshold, threshold24h, new Date().toISOString());
+      q.insertToken.run(
+        chain, address, threshold, threshold24h, new Date().toISOString(),
+        Number(DEFAULT_PRICE_ALERT_PCT),
+        Number(DEFAULT_LIQ_DROP_PCT),
+        Number(DEFAULT_IMBALANCE_RATIO)
+      );
       const t24Line = threshold24h > 0
         ? `24h 阈值: $${fmt(threshold24h, 0)}`
         : '24h 阈值: 关闭';
@@ -610,6 +760,45 @@ async function handleCmd(text, chatId) {
     const oldStr = token.threshold24h > 0 ? `$${fmt(token.threshold24h, 0)}` : '关闭';
     const newStr = threshold > 0 ? `$${fmt(threshold, 0)}` : '关闭';
     return sendMsg(`✅ 24h 阈值 ${oldStr} → ${newStr}`, chatId);
+  }
+
+  if (command === '/pricealert') {
+    const [address, pctStr] = args;
+    const token = findToken(address);
+    if (!token) return sendMsg('❌ 列表中没有这个代币', chatId);
+    if (pctStr === undefined) return sendMsg('用法: `/pricealert <地址> <百分比>` (0=关闭)', chatId);
+    const pct = Number(pctStr);
+    if (Number.isNaN(pct) || pct < 0) return sendMsg('❌ 百分比必须 >=0 (0=关闭)', chatId);
+    q.setPriceAlert.run(pct, token.chain, token.address);
+    const oldStr = token.priceAlertPct > 0 ? `±${fmt(token.priceAlertPct, 1)}%` : '关闭';
+    const newStr = pct > 0 ? `±${fmt(pct, 1)}%` : '关闭';
+    return sendMsg(`✅ 价格告警阈值 ${oldStr} → ${newStr}`, chatId);
+  }
+
+  if (command === '/liqalert') {
+    const [address, pctStr] = args;
+    const token = findToken(address);
+    if (!token) return sendMsg('❌ 列表中没有这个代币', chatId);
+    if (pctStr === undefined) return sendMsg('用法: `/liqalert <地址> <百分比>` (0=关闭)', chatId);
+    const pct = Number(pctStr);
+    if (Number.isNaN(pct) || pct < 0 || pct > 100) return sendMsg('❌ 百分比必须在 0-100 之间 (0=关闭)', chatId);
+    q.setLiqDrop.run(pct, token.chain, token.address);
+    const oldStr = token.liqDropPct > 0 ? `${fmt(token.liqDropPct, 0)}%` : '关闭';
+    const newStr = pct > 0 ? `${fmt(pct, 0)}%` : '关闭';
+    return sendMsg(`✅ 流动性骤降阈值 ${oldStr} → ${newStr}`, chatId);
+  }
+
+  if (command === '/imbalance') {
+    const [address, ratioStr] = args;
+    const token = findToken(address);
+    if (!token) return sendMsg('❌ 列表中没有这个代币', chatId);
+    if (ratioStr === undefined) return sendMsg('用法: `/imbalance <地址> <比例>` (0=关闭, 常用 3-10)', chatId);
+    const ratio = Number(ratioStr);
+    if (Number.isNaN(ratio) || ratio < 0) return sendMsg('❌ 比例必须 >=0 (0=关闭)', chatId);
+    q.setImbalance.run(ratio, token.chain, token.address);
+    const oldStr = token.imbalanceRatio > 0 ? `${fmt(token.imbalanceRatio, 1)}x` : '关闭';
+    const newStr = ratio > 0 ? `${fmt(ratio, 1)}x` : '关闭';
+    return sendMsg(`✅ 买卖失衡阈值 ${oldStr} → ${newStr}`, chatId);
   }
 
   if (command === '/check') {
