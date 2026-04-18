@@ -33,7 +33,26 @@ const COOLDOWN_LIQ_MS = 30 * 60 * 1000;
 const COOLDOWN_IMB_MS = 60 * 60 * 1000;
 const LIQ_SNAPSHOT_STALE_MS = 2 * 60 * 60 * 1000;
 const IMB_MIN_TXNS = 10;
+const PENDING_TTL_MS = 5 * 60 * 1000;
 const HISTORY_RETENTION_MS = Math.max(1, Number(HISTORY_DAYS)) * 24 * 60 * 60 * 1000;
+
+// chatId -> { prefix: 待补全的命令前缀, ts: 设置时间 }
+// 收到非命令消息时, 如果存在未过期的 pending, 自动拼成 "prefix + 用户输入" 执行
+const pendingCmd = new Map();
+function setPending(chatId, prefix) {
+  pendingCmd.set(String(chatId), { prefix, ts: Date.now() });
+}
+function takePending(chatId) {
+  const k = String(chatId);
+  const p = pendingCmd.get(k);
+  if (!p) return null;
+  pendingCmd.delete(k);
+  if (Date.now() - p.ts > PENDING_TTL_MS) return null;
+  return p.prefix;
+}
+function clearPending(chatId) {
+  pendingCmd.delete(String(chatId));
+}
 
 // ========== SQLite ==========
 fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
@@ -516,10 +535,16 @@ const HELP = `*🤖 代币链上监控*
 
 /menu - 打开主菜单
 /list - 查看监控列表 (带操作按钮)
-/add <地址> [阈值1h] [阈值24h] [链] - 添加代币
-/remove <地址> - 删除代币
-/check <地址> [链] - 立即查询一次
-/history <地址> [小时数] - 查看历史趋势
+/add [地址] [阈值1h] [阈值24h] [链] - 添加代币
+/remove [地址] - 删除代币
+/check [地址] [链] - 立即查询一次
+/history [地址] [小时数] - 查看历史趋势
+
+💡 *所有命令可先发命令名, 再单独回复参数*
+例: 发 /add → 直接粘贴地址即可, 无需再打命令
+直接发地址 → 自动等同于 /check
+
+/cancel - 取消正在等待回复的命令
 
 *告警阈值* (0 = 关闭)
 /threshold <地址> <USD> - 1h 成交量
@@ -550,6 +575,7 @@ const BOT_COMMANDS = [
   { command: 'pricealert', description: '价格异动告警阈值' },
   { command: 'liqalert', description: '流动性骤降告警' },
   { command: 'imbalance', description: '买卖失衡告警' },
+  { command: 'cancel', description: '取消等待回复的命令' },
   { command: 'help', description: '使用帮助' }
 ];
 
@@ -671,9 +697,23 @@ function historySummary(token, hours) {
   };
 }
 
+// 让用户无需重输命令: 提示 + 记录 pending
+async function promptReply(chatId, title, hint, prefix) {
+  setPending(chatId, prefix);
+  return sendMsg(
+    `${title}\n\n💬 直接回复 ${hint} 即可, 无需再打命令\n/cancel 取消`,
+    chatId
+  );
+}
+
 async function handleCmd(text, chatId) {
   const [cmd, ...args] = text.trim().split(/\s+/);
   const command = cmd.split('@')[0].toLowerCase();
+
+  if (command === '/cancel') {
+    clearPending(chatId);
+    return sendMsg('❌ 已取消', chatId);
+  }
 
   if (command === '/start' || command === '/help') {
     return sendMsg(HELP, chatId, mainMenuKeyboard());
@@ -689,7 +729,9 @@ async function handleCmd(text, chatId) {
 
   if (command === '/add') {
     const [address, thresholdStr, threshold24hStr, chainArg] = args;
-    if (!address) return sendMsg('用法: `/add <地址> [阈值1h] [阈值24h] [链]`', chatId);
+    if (!address) {
+      return promptReply(chatId, '📥 *添加代币*', '合约地址 `[阈值1h] [阈值24h] [链]`', '/add');
+    }
     if (findToken(address)) return sendMsg('⚠️ 该代币已在列表中', chatId);
     const threshold = Number(thresholdStr) || Number(DEFAULT_THRESHOLD_USD);
     const threshold24h = threshold24hStr !== undefined
@@ -723,7 +765,9 @@ async function handleCmd(text, chatId) {
 
   if (command === '/remove') {
     const [address] = args;
-    if (!address) return sendMsg('用法: `/remove <地址>`', chatId);
+    if (!address) {
+      return promptReply(chatId, '🗑 *删除代币*', '要删除的合约地址', '/remove');
+    }
     const token = findToken(address);
     if (!token) return sendMsg('❌ 列表中没有这个代币', chatId);
     const txn = db.transaction(() => {
@@ -737,20 +781,25 @@ async function handleCmd(text, chatId) {
 
   if (command === '/threshold') {
     const [address, thresholdStr] = args;
+    if (!address) return promptReply(chatId, '⚙️ *修改 1h 阈值*', '`地址 USD金额`', '/threshold');
     const token = findToken(address);
     if (!token) return sendMsg('❌ 列表中没有这个代币', chatId);
+    if (thresholdStr === undefined) {
+      return promptReply(chatId, '⚙️ *修改 1h 阈值*', 'USD 金额', `/threshold ${address}`);
+    }
     const threshold = Number(thresholdStr);
-    if (!threshold || threshold <= 0) return sendMsg('用法: `/threshold <地址> <阈值USD>`', chatId);
+    if (!threshold || threshold <= 0) return sendMsg('❌ 阈值必须是 > 0 的数字', chatId);
     q.setThreshold.run(threshold, token.chain, token.address);
     return sendMsg(`✅ 1h 阈值 $${fmt(token.threshold, 0)} → $${fmt(threshold, 0)}`, chatId);
   }
 
   if (command === '/threshold24h') {
     const [address, thresholdStr] = args;
+    if (!address) return promptReply(chatId, '⚙️ *修改 24h 阈值*', '`地址 USD金额` (0=关闭)', '/threshold24h');
     const token = findToken(address);
     if (!token) return sendMsg('❌ 列表中没有这个代币', chatId);
     if (thresholdStr === undefined) {
-      return sendMsg('用法: `/threshold24h <地址> <阈值USD>` (0=关闭)', chatId);
+      return promptReply(chatId, '⚙️ *修改 24h 阈值*', 'USD 金额 (0=关闭)', `/threshold24h ${address}`);
     }
     const threshold = Number(thresholdStr);
     if (Number.isNaN(threshold) || threshold < 0) {
@@ -764,9 +813,12 @@ async function handleCmd(text, chatId) {
 
   if (command === '/pricealert') {
     const [address, pctStr] = args;
+    if (!address) return promptReply(chatId, '📢 *价格异动阈值*', '`地址 百分比` (0=关闭)', '/pricealert');
     const token = findToken(address);
     if (!token) return sendMsg('❌ 列表中没有这个代币', chatId);
-    if (pctStr === undefined) return sendMsg('用法: `/pricealert <地址> <百分比>` (0=关闭)', chatId);
+    if (pctStr === undefined) {
+      return promptReply(chatId, '📢 *价格异动阈值*', '百分比 (0=关闭)', `/pricealert ${address}`);
+    }
     const pct = Number(pctStr);
     if (Number.isNaN(pct) || pct < 0) return sendMsg('❌ 百分比必须 >=0 (0=关闭)', chatId);
     q.setPriceAlert.run(pct, token.chain, token.address);
@@ -777,9 +829,12 @@ async function handleCmd(text, chatId) {
 
   if (command === '/liqalert') {
     const [address, pctStr] = args;
+    if (!address) return promptReply(chatId, '🔥 *流动性骤降阈值*', '`地址 百分比` (0=关闭)', '/liqalert');
     const token = findToken(address);
     if (!token) return sendMsg('❌ 列表中没有这个代币', chatId);
-    if (pctStr === undefined) return sendMsg('用法: `/liqalert <地址> <百分比>` (0=关闭)', chatId);
+    if (pctStr === undefined) {
+      return promptReply(chatId, '🔥 *流动性骤降阈值*', '百分比 (0=关闭)', `/liqalert ${address}`);
+    }
     const pct = Number(pctStr);
     if (Number.isNaN(pct) || pct < 0 || pct > 100) return sendMsg('❌ 百分比必须在 0-100 之间 (0=关闭)', chatId);
     q.setLiqDrop.run(pct, token.chain, token.address);
@@ -790,9 +845,12 @@ async function handleCmd(text, chatId) {
 
   if (command === '/imbalance') {
     const [address, ratioStr] = args;
+    if (!address) return promptReply(chatId, '⚖️ *买卖失衡阈值*', '`地址 比例` (常用 3-10, 0=关闭)', '/imbalance');
     const token = findToken(address);
     if (!token) return sendMsg('❌ 列表中没有这个代币', chatId);
-    if (ratioStr === undefined) return sendMsg('用法: `/imbalance <地址> <比例>` (0=关闭, 常用 3-10)', chatId);
+    if (ratioStr === undefined) {
+      return promptReply(chatId, '⚖️ *买卖失衡阈值*', '比例 (常用 3-10, 0=关闭)', `/imbalance ${address}`);
+    }
     const ratio = Number(ratioStr);
     if (Number.isNaN(ratio) || ratio < 0) return sendMsg('❌ 比例必须 >=0 (0=关闭)', chatId);
     q.setImbalance.run(ratio, token.chain, token.address);
@@ -803,7 +861,9 @@ async function handleCmd(text, chatId) {
 
   if (command === '/check') {
     const [address, chainArg] = args;
-    if (!address) return sendMsg('用法: `/check <地址> [链]`', chatId);
+    if (!address) {
+      return promptReply(chatId, '📊 *立即查询*', '合约地址 `[链]`', '/check');
+    }
     const token = findToken(address) || {
       address,
       chain: (chainArg || DEFAULT_CHAIN).toLowerCase(),
@@ -815,7 +875,9 @@ async function handleCmd(text, chatId) {
 
   if (command === '/history') {
     const [address, hoursStr] = args;
-    if (!address) return sendMsg('用法: `/history <地址> [小时数]`', chatId);
+    if (!address) {
+      return promptReply(chatId, '📈 *历史趋势*', '合约地址 `[小时数]`', '/history');
+    }
     const token = findToken(address);
     if (!token) return sendMsg('❌ 列表中没有这个代币, 请先 /add', chatId);
     const maxHours = Math.max(1, Number(HISTORY_DAYS)) * 24;
@@ -935,8 +997,26 @@ async function pollUpdates() {
         console.log('忽略未授权消息 from', chatId);
         continue;
       }
-      if (msg.text.startsWith('/')) {
-        handleCmd(msg.text, chatId).catch(err => console.error('命令错误:', err));
+
+      const text = msg.text.trim();
+
+      if (text.startsWith('/')) {
+        // 新命令自动清除未完成的 pending 上下文
+        clearPending(chatId);
+        handleCmd(text, chatId).catch(err => console.error('命令错误:', err));
+        continue;
+      }
+
+      // 非命令: 若有 pending, 拼成完整命令执行
+      const pending = takePending(chatId);
+      if (pending) {
+        handleCmd(`${pending} ${text}`, chatId).catch(err => console.error('命令错误:', err));
+        continue;
+      }
+
+      // 裸地址 -> 当 /check 处理
+      if (/^0x[a-fA-F0-9]{40}$/.test(text) || /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(text)) {
+        handleCmd(`/check ${text}`, chatId).catch(err => console.error('命令错误:', err));
       }
     }
   } catch (err) {
